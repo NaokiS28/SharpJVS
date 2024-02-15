@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using System.IO.Ports;
 using System.Linq;
 using System.Threading;
+using System.Text;
+using System.Globalization;
 
 
 namespace SharpJVS
@@ -103,20 +105,24 @@ namespace SharpJVS
         public const int JVS_CHARACTER_KATA = 3;
         public const int JVS_CHARACTER_KANJI = 4;
 
-        private IEnumerable<JVSIOBoard> _boards;
+        public List<JVSIOBoard> _boards = new List<JVSIOBoard> { };
 
         private bool _isRunning = true;
         private string _comPortName;
         private Int32 _comPortBaud;
         private SerialPort _comPort;
+        private bool _useDSR = false;
+        private bool _useCD = false;
 
         private byte thisNodeID = JVS_HOST_ADDR;
         private JVS_Frame LastSent = null;
 
-        public JVS(string _Sp, Int32 _Baud = 115200)
+        public JVS(string _Sp, Int32 _Baud = 115200, bool useCD = false, bool useDSR = false)
         {
             _comPortName = _Sp;
             _comPortBaud = _Baud;
+            _useCD = useCD;
+            _useDSR = useDSR;
         }
 
         /*
@@ -140,14 +146,88 @@ namespace SharpJVS
         public int Main()
         {
             int errorCode = 0;
-            Connect();
 
-            while (_isRunning)
+            // Init IO Boards
+            int _ioCount = Connect();
+            if (_ioCount > 0x20) { return _ioCount; }
+
+            // Get all IO Board specs
+            if (_ioCount == 0)
             {
-                // JVS CRAP
+                Console.WriteLine("JVS: No IO Boards found.");
+            }
+            else
+            {
+                Console.WriteLine("Found: ");
+            }
+            for (int i = 1; i <= _ioCount; i++)
+            {
+                for (int t = 0; t < 3; t++)
+                {
+                    JVSIOBoard board = GetIOMetaDeta(_ioCount);
+                    if (board != null)
+                    {
+                        _boards.Add(board);
+                        break;
+                    }
+                }
+
+                Console.WriteLine(
+                    _boards[i - 1].NodeID.ToString() + ": " +
+                    _boards[i - 1].Identity
+                    );
             }
 
+            /*while (_isRunning)
+            {
+                // JVS CRAP
+            }*/
+
             return errorCode;
+        }
+
+        public JVSIOBoard GetIOMetaDeta(int _id)
+        {
+            string ioName = "";
+            int ioCmd = 0;
+            int ioJVS = 0;
+            int ioCom = 0;
+            List<Feature> ioFeat = new List<Feature> { };
+
+            // Get IO board name
+            JVS_Frame _frame = new JVS_Frame((byte)_id, new List<byte> { JVS_IOIDENT_CODE });
+            Write(_frame);
+            JVS_Frame _reply = Read();
+            if (_reply != null)
+            {
+                ioName = System.Text.Encoding.ASCII.GetString(_reply.data.ToArray(),1,_reply.data.Count()-1);
+            }
+
+            _frame = new JVS_Frame((byte)_id, new List<byte> { JVS_CMDREV_CODE, JVS_JVSREV_CODE, JVS_COMVER_CODE, JVS_FEATCHK_CODE });
+            Write(_frame);
+            _reply = Read();
+            if (_reply != null)
+            {
+                ioCmd = _reply.data[1];
+                ioJVS = _reply.data[3];
+                ioCom = _reply.data[5];
+                bool _featDone = false;
+                for (int f = 7; !_featDone; f++)
+                {
+                    byte fType = _reply.data[f++];
+                    if (fType == JVS_FEATURE_END)
+                    {
+                        _featDone = true;
+                        break;
+                    }
+                    byte fP1 = _reply.data[f++];
+                    byte fP2 = _reply.data[f++];
+                    byte fP3 = _reply.data[f];
+                    ioFeat.Add(new Feature(fType, new byte[] { fP1, fP2, fP3 }));
+                }
+
+            }
+            return new JVSIOBoard((byte)_id, ioName, ioCom, ioJVS, ioCmd, ioFeat);
         }
 
         public void Reset()
@@ -161,7 +241,7 @@ namespace SharpJVS
 
         private int Connect()
         {
-            int _errorCode = 0;
+            int _ioCount = 0;
 
             if (_comPortName == null)
             {
@@ -178,16 +258,33 @@ namespace SharpJVS
                 Console.WriteLine(_comPortName + " opened at " + _comPortBaud.ToString() + ".");
                 Reset();
 
-                int _ioCount = 0;
-                bool _addrErr = false;
-                while (_ioCount < 15 && !_comPort.CDHolding && !_addrErr)
+                int _addrErr = 0;
+
+                bool _addrDone = false;
+
+                if (_useCD || _useDSR)
                 {
-                    JVS_Frame _idF = new JVS_Frame((byte)(_ioCount+1), new List<byte> { JVS_SETADDR_CODE });
-                    Write(_idF);
-                    Thread.Sleep(10);
-                    if (_comPort.BytesToRead > 0)
+                    _addrDone = ReadSense() > 0;
+                }
+
+                while (_ioCount < 15 && !_addrDone && _addrErr < 3)
+                {
+                    if (_useCD || _useDSR)
                     {
-                        JVS_Frame _ioR = Read();
+                        _addrDone = ReadSense() > 0;
+                    } else
+                    {
+                        // No way to check for more boards using the standard, assume only one is needed.
+                        _addrDone = true;
+                    }
+
+                    JVS_Frame _idF = new JVS_Frame((byte)(JVS_BROADCAST_ADDR), new List<byte> { JVS_SETADDR_CODE, (byte)(_ioCount + 1) });
+                    Write(_idF);
+
+                    JVS_Frame _ioR = Read();
+                    if (_ioR == null) { _addrErr++; }
+                    else
+                    {
                         if (_ioR.statusCode == JVS_STATUS_NORMAL && _ioR.data[0] == JVS_REPORT_NORMAL)
                         {
                             _ioCount++;
@@ -195,9 +292,15 @@ namespace SharpJVS
                         else
                         {
                             Console.WriteLine("JVS: IO " + _ioCount + " Reported Error: SC: " + _ioR.statusCode.ToString() + ", R: " + _ioR.data[0]);
-                            _addrErr = true;
+                            _addrErr++;
                         }
+
                     }
+                }
+                if (_addrErr == 3)
+                {
+                    Console.WriteLine("JVS: Error setting address ID: " + (_ioCount + 1).ToString());
+                    _ioCount += 0x21;
                 }
             }
             catch (Exception ex)
@@ -205,13 +308,40 @@ namespace SharpJVS
                 Console.WriteLine("Error: " + ex.Message);
             }
 
-            return _errorCode;
+            return _ioCount;
         }
 
         public void Close()
         {
             // Disconnect from serial
             _isRunning = false;
+        }
+
+        public int ReadSense()
+        {
+            if (_useCD)
+            {
+                if (_comPort.CDHolding)
+                {
+                    return 1;
+                }
+                else
+                {
+                    return 0;
+                }
+            }
+            else if (_useDSR)
+            {
+                if (_comPort.DsrHolding)
+                {
+                    return 1;
+                }
+                else
+                {
+                    return 0;
+                }
+            }
+            else return 1;
         }
 
         private int Resend()
@@ -240,10 +370,8 @@ namespace SharpJVS
         {
             if (waitForBytes(5) != 0) { return null; }
 
-            byte[] _d = new byte[] { };
-            _comPort.Read(_d, 0, 5);
+            List<byte> _d = new List<byte> { };
 
-            JVS_Frame _f = null;
             int _errCode = 0;
             bool _fDone = false;
             int _fIndex = 0;
@@ -251,6 +379,7 @@ namespace SharpJVS
 
             while (!_fDone && _errCode == 0)
             {
+                _d.Insert(_fIndex, (byte)_comPort.ReadByte());
                 switch (_fStep)
                 {
                     default:
@@ -275,86 +404,56 @@ namespace SharpJVS
                     case 2:
                         // JVS Number of bytes
                         byte x = _d[_fIndex++];
-                        if (_comPort.BytesToRead >= x)
-                        {
-                            _fStep++;
-                        }
-                        else
+                        if (_comPort.BytesToRead < x)
                         {
                             if (waitForBytes(x) != 0)
                             {
                                 // Prevent timeout whilst waiting for rest of packet
                                 Console.WriteLine("JVS: Timeout whilst waiting for remainder of packet.");
                                 return null;
-                            }
-                            else
-                            {
-                                byte[] _d2 = new byte[] { };
-                                _comPort.Read(_d2, 0, x);
-                                _d.Concat(_d2);
-                                _f = new JVS_Frame(_d2);
-                                _fStep++;
-                            }
 
-                        }
-                        break;
-                    case 3:
-                        // JVS Status byte
-                        if (thisNodeID != JVS_HOST_ADDR)
-                        {
-                            _fStep++;  // Skip this step
-                        }
-                        else
-                        {
-                            switch (_f.statusCode)
-                            {
-                                case JVS_STATUS_NORMAL: _fStep++; break;
-                                case JVS_STATUS_CHECKSUMERROR: Resend(); break;
-                                case JVS_STATUS_OVERFLOW: _errCode = 11; break;
-                                case JVS_STATUS_UNKNOWNCMD:
-                                    Console.WriteLine("JVS: IO Reported unsupported command");
-                                    string hex = BitConverter.ToString(_f.data.ToArray());
-                                    Console.WriteLine("\t" + hex);
-                                    break;
                             }
                         }
-                        break;
-                    case 4:
-                        // JVS Data
-                        // Ignore?
-                        _fStep++;
-                        break;
-                    case 5:
-                        // JVS Sum
-                        byte sum = _f.calculateSum();
-                        if (_f.sum != sum)
+
+                        // All bytes are in buffer?
+                        while (_comPort.BytesToRead > 0)
                         {
-                            Console.WriteLine("JVS: Checksum error.");
-                            Console.WriteLine("\t Expected: " + sum.ToString("2X") + " received: 0x" + _f.data.Last().ToString("2X"));
+                            _d.Add((byte)_comPort.ReadByte());
                         }
-                        else
-                        {
-                            _fDone = true;
-                        }
+                        _fDone = true;
                         break;
                 }
             }
 
+            JVS_Frame _f = new JVS_Frame(_d.ToArray());
+            switch (_f.statusCode)
+            {
+                case JVS_STATUS_NORMAL: _fStep++; break;
+                case JVS_STATUS_CHECKSUMERROR: Resend(); break;
+                case JVS_STATUS_OVERFLOW: _errCode = 11; break;
+                case JVS_STATUS_UNKNOWNCMD:
+                    Console.WriteLine("JVS: IO Reported unsupported command");
+                    string hex = BitConverter.ToString(_f.data.ToArray());
+                    Console.WriteLine("\t" + hex);
+                    break;
+            }
+
             if (_errCode != 0) { return null; }
+
+            
 
             return _f;
         }
 
         private int waitForBytes(int _nB)
         {
-            long readTimer = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-            long currTime;
-            while (!(_comPort.BytesToRead > _nB))
+            int _timeOut = 0;
+            while (_comPort.BytesToRead < _nB)
             {
                 // Wait for bytes to arrive
                 Thread.Sleep(5);
-                currTime = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-                if ((currTime - readTimer) < 100)
+                _timeOut++;
+                if (_timeOut > 40)
                 {
                     return 1;
                 }
@@ -385,9 +484,9 @@ namespace PSJVS.Containers
         public int CommVersion;
         public int JVSVersion;
         public int CmdVersion;
-        public Feature[] Features;
+        public List<Feature> Features;
 
-        public JVSIOBoard(byte _Id, string _N, int _CoV, int _JV, int _CmV, Feature[] _f)
+        public JVSIOBoard(byte _Id, string _N, int _CoV, int _JV, int _CmV, List<Feature> _f)
         {
             NodeID = _Id;
             Identity = _N;
@@ -452,12 +551,14 @@ namespace PSJVS.Containers
         public byte nodeID = 0;
         public byte numBytes = 0;          // Includes all data bytes and sync
         public byte statusCode = 1;
-        public List<byte> data;
+        public List<byte> data = new List<byte> { };
         public byte sum = 0;                // Checksum of ID, numbytes, data bytes
         public List<byte> rawPacket = new List<byte> { };
 
         public JVS_Frame(byte[] _d, bool isHost = true)
         {
+            int idx = 1; // Ignore sync here
+
             rawPacket = new List<byte>(_d);
             // Find all occurrences of = 0xE0 in the list
             for (int i = 0; i < rawPacket.Count; i++)
@@ -469,17 +570,17 @@ namespace PSJVS.Containers
                     rawPacket[i]++;
                 }
             }
-            nodeID = rawPacket[0];
-            numBytes = rawPacket[1];
+            nodeID = rawPacket[idx++];
+            numBytes = rawPacket[idx++];
             if (isHost)
             {
-                statusCode = rawPacket[2];
-                for (int i = 3; i < rawPacket.Count() - 1; i++)
+                statusCode = rawPacket[idx++];
+                for (int i = 0; i < numBytes-2; i++)
                 {
-                    data.Add(rawPacket[i]);
+                   data.Add(rawPacket[idx++]);
                 }
             }
-            sum = rawPacket[rawPacket.Count() - 1];
+            sum = rawPacket[idx++];
         }
 
         public JVS_Frame(byte _id, List<byte> _data, bool isHost = true, byte _Sc = 1)
@@ -488,7 +589,7 @@ namespace PSJVS.Containers
             data = _data;
             statusCode = _Sc;
             numBytes = (byte)data.Count();
-            byte packetBytes = 1;
+            byte packetBytes = 0;
 
             if (isHost) packetBytes++;
 
@@ -521,7 +622,7 @@ namespace PSJVS.Containers
         {
             UInt32 _s = 0;
             _s += nodeID;
-            _s += numBytes;
+            _s += (byte)(numBytes + 1);
             if ((!isHost && send) || (isHost && !send))
             {
                 _s += statusCode;
