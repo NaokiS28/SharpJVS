@@ -3,7 +3,6 @@ using System;
 using System.Collections.Generic;
 using System.IO.Ports;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -17,8 +16,12 @@ namespace SharpJVS
         public const byte BUFFER_READ_ERROR = 3;
         public const byte JVS_BUFFER_SIZE = 1;
 
-        public const bool JVS_SENSE_INACTIVE = false;
-        public const bool JVS_SENSE_ACTIVE = true;
+        public const bool JVS_SENSEOUT_INACTIVE = false;
+        public const bool JVS_SENSEOUT_ACTIVE = true;
+
+        public const int JVS_SENSEIN_NOIO = 0;
+        public const int JVS_SENSEIN_IOPRESENT = 1;
+        public const int JVS_SENSEIN_IOREADY = 2;
 
         public const byte HOST_NODE = 1;
         public const byte DEVICE_NODE = 0;
@@ -105,21 +108,27 @@ namespace SharpJVS
         public const int JVS_CHARACTER_KATA = 3;
         public const int JVS_CHARACTER_KANJI = 4;
 
-        public List<JVSIOBoard> _boards = new List<JVSIOBoard> { };
+        public const int JVS_SENSEIN_NONE = 0;
+        public const int JVS_SENSEIN_IS_CD = 1;
+        public const int JVS_SENSEIN_IS_DSR = 2;
+        public const int JVS_SENSEIN_IS_CD_DSR = 3;
+        public const int JVS_SENSEOUT_NONE = 0;
+        public const int JVS_SENSEOUT_IS_DTR = 4;
 
-        private bool _isRunning = true;
+        public List<JVSIOBoard> boards = new List<JVSIOBoard> { };
+
+        public bool _isRunning = true;
 
         private SerialPort _comPort;
-        private readonly bool  _useDSR = false;
-        private readonly bool _useCD = false;
-        private readonly bool _useDTR = false;
         private readonly string _comPortName;
         private readonly Int32 _comPortBaud;
+        private readonly int _comSenseInPin = JVS_SENSEIN_NONE;
+        private readonly int _comSenseOutPin = JVS_SENSEOUT_NONE;
 
-        private byte thisNodeID = JVS_HOST_ADDR;
         private readonly JVSIOBoard thisNodeInfo = null;
-        private JVS_Frame TXBuffer = null;
-        private JVS_Frame RXBuffer = null;
+        private JVS_Frame _TXLastSent = null;
+        private List<JVS_Frame> _TXBuffer = new List<JVS_Frame> { };
+        private List<JVS_Frame> _RXBuffer = new List<JVS_Frame> { };
         private bool _rxFlag = false;
 
         // IO Data arrays
@@ -130,25 +139,56 @@ namespace SharpJVS
         public byte[] outputSlots = null;
         public int[] analogArray = null;
 
+        ~JVS()
+        {
+            Close();
+        }
 
-        public JVS(string _Sp, Int32 _Baud = 115200, bool isHost = true, bool useCD = false, bool useDSR = false)
+        public JVS(
+            string _Sp, Int32 _Baud = 115200,
+            JVSIOBoard _b = null,
+            bool isHost = true,
+            int senseInSetting = JVS_SENSEIN_NONE,
+            int senseOutSetting = JVS_SENSEOUT_NONE
+            )
         {
             _comPortName = _Sp;
             _comPortBaud = _Baud;
-            _useCD = useCD;
-            _useDSR = useDSR;
-            byte ioA;
+            _comSenseInPin = senseInSetting;
+            _comSenseOutPin = senseOutSetting;
 
+            byte ioA;
             if (isHost)
             {
                 ioA = JVS_HOST_ADDR;
-            } else
+            }
+            else
             {
                 ioA = 0xFE;
             }
+            if (_b == null)
+            {
+                thisNodeInfo = new JVSIOBoard(ioA, "Sharp JVS for Windows;Naokis Retro Corner;V0.1", 17, 17, 17, new List<Feature> { });
+            }
+            else
+            {
+                thisNodeInfo = _b;
+            }
+        }
 
-            // MAke this better later
-            thisNodeInfo = new JVSIOBoard(ioA, "Sharp JVS for Windows;Naokis Retro Corner;V0.1", 17, 17, 17, new List<Feature> { });
+        public void SetMachineArray(byte arr) { machineSwitches = arr; }
+        public void SetPlayerArray(byte[] arr) { playerArray = arr; }
+        public void SetAnalogArray(int[] arr) { analogArray = arr; }
+        public void SetCoinArray(int[] arr) { coinSlots = arr; }
+        public void SetCoinMechArray(byte[] arr) { coinCondition = arr; }
+        public void SetOutputArray(byte[] arr) { outputSlots = arr; }
+
+        public static byte Reverse(byte b)
+        {
+            b = (byte)((b & 0xF0) >> 4 | (b & 0x0F) << 4);
+            b = (byte)((b & 0xCC) >> 2 | (b & 0x33) << 2);
+            b = (byte)((b & 0xAA) >> 1 | (b & 0x55) << 1);
+            return b;
         }
 
         public async Task<int> MainAsync()
@@ -157,13 +197,65 @@ namespace SharpJVS
 
             await Task.Run(() =>
             {
-                Connect();
-                while (_isRunning)
+                try
                 {
-                    // JVS CRAP
+                    // Init IO Boards
+                    int _ioCount = Connect();
+                    if (_ioCount > 0x20) { errorCode = _ioCount; }
+                    else
+                    {
+                        // Get all IO Board specs
+                        if (_ioCount == 0)
+                        {
+                            Console.WriteLine("JVS: No IO Boards found.");
+                        }
+                        else
+                        {
+                            Console.WriteLine("Found: ");
+                        }
+                        for (int i = 1; i <= _ioCount; i++)
+                        {
+                            for (int t = 0; t < 3; t++)
+                            {
+                                JVSIOBoard board = GetIOMetaDeta(_ioCount);
+                                if (board != null)
+                                {
+                                    boards.Add(board);
+                                    break;
+                                }
+                            }
+
+                            Console.WriteLine(
+                                boards[i - 1].NodeID.ToString() + ": " +
+                                boards[i - 1].Identity
+                                );
+                        }
+
+                        if (_ioCount > 0)
+                        {
+                            while (_isRunning)
+                            {
+                                if (Available())
+                                {
+                                    _RXBuffer.Add(Read());
+
+                                }
+
+                                if (_TXBuffer.Count() > 0)
+                                {
+                                    Write(_TXBuffer.First());
+                                    _TXBuffer.RemoveAt(0);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("JVS Exception: " + ex.Message);
                 }
             });
-
+            Close();
             return errorCode;
         }
 
@@ -172,42 +264,54 @@ namespace SharpJVS
         {
             int errorCode = 0;
 
-            // Init IO Boards
-            int _ioCount = Connect();
-            if (_ioCount > 0x20) { return _ioCount; }
+            try
+            {
+                // Init IO Boards
+                int _ioCount = Connect();
+                if (_ioCount > 0x20) { return _ioCount; }
 
-            // Get all IO Board specs
-            if (_ioCount == 0)
-            {
-                Console.WriteLine("JVS: No IO Boards found.");
-            }
-            else
-            {
-                Console.WriteLine("Found: ");
-            }
-            for (int i = 1; i <= _ioCount; i++)
-            {
-                for (int t = 0; t < 3; t++)
+                // Get all IO Board specs
+                if (_ioCount == 0)
                 {
-                    JVSIOBoard board = GetIOMetaDeta(_ioCount);
-                    if (board != null)
+                    Console.WriteLine("JVS: No IO Boards found.");
+                }
+                else
+                {
+                    Console.WriteLine("Found: ");
+                }
+                for (int i = 1; i <= _ioCount; i++)
+                {
+                    for (int t = 0; t < 3; t++)
                     {
-                        _boards.Add(board);
-                        break;
+                        JVSIOBoard board = GetIOMetaDeta(_ioCount);
+                        if (board != null)
+                        {
+                            boards.Add(board);
+                            break;
+                        }
                     }
+
+                    Console.WriteLine(
+                        boards[i - 1].NodeID.ToString() + ": " +
+                        boards[i - 1].Identity
+                        );
                 }
 
-                Console.WriteLine(
-                    _boards[i - 1].NodeID.ToString() + ": " +
-                    _boards[i - 1].Identity
-                    );
+                if (_ioCount > 0)
+                {
+                    while (_isRunning)
+                    {
+                        // JVS CRAP
+                        // Yes, I need to do stuff here, please dont tell me about it, I will ban.
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("JVS Exception: " + ex.Message);
             }
 
-            /*while (_isRunning)
-            {
-                // JVS CRAP
-            }*/
-
+            Close();
             return errorCode;
         }
 
@@ -235,7 +339,7 @@ namespace SharpJVS
                 ioJVS = _reply.data[3];
                 ioCom = _reply.data[5];
                 int f = 7;
-                while(f < _reply.data.Count())
+                while (f < _reply.data.Count())
                 {
                     byte fType = _reply.data[f++];
                     if (fType == JVS_FEATURE_END)
@@ -284,27 +388,18 @@ namespace SharpJVS
                 int _addrErr = 0;
                 bool _addrDone = false;
 
-                if (_useCD || _useDSR)
-                {
-                    _addrDone = ReadSense() > 0;
-                }
-
                 while (_ioCount < 15 && !_addrDone && _addrErr < 3)
                 {
-                    if (_useCD || _useDSR)
-                    {
-                        _addrDone = ReadSense() > 0;
-                    } else
-                    {
-                        // No way to check for more boards using the standard, assume only one is needed.
-                        _addrDone = true;
-                    }
+                    _addrDone = ReadSense() == JVS_SENSEIN_IOREADY;
 
                     JVS_Frame _idF = new JVS_Frame((byte)(JVS_BROADCAST_ADDR), new List<byte> { JVS_SETADDR_CODE, (byte)(_ioCount + 1) });
                     Write(_idF);
 
                     JVS_Frame _ioR = Read();
-                    if (_ioR == null) { _addrErr++; }
+                    if (_ioR == null)
+                    {
+                        _addrErr++;
+                    }
                     else
                     {
                         if (_ioR.statusCode == JVS_STATUS_NORMAL && _ioR.data[0] == JVS_REPORT_NORMAL)
@@ -327,7 +422,7 @@ namespace SharpJVS
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Error: " + ex.Message);
+                Console.WriteLine("JVS Exception: " + ex.Message);
             }
 
             return _ioCount;
@@ -336,41 +431,39 @@ namespace SharpJVS
         public void Close()
         {
             // Disconnect from serial
+            // This works but doesn't. It causes a exception error when closing.
             _isRunning = false;
+            Reset();
+            Thread.Sleep(10);
             _comPort.Close();
         }
 
         public int ReadSense()
         {
-            if (_useCD)
+            // If no sense pin has been configured, then return IOREADY.
+            // The IO init process will work, but only once.
+            switch (_comSenseInPin)
             {
-                if (_comPort.CDHolding)
-                {
-                    return 1;
-                }
-                else
-                {
-                    return 0;
-                }
+                case JVS_SENSEIN_IS_CD:
+                    if (_comPort.CDHolding) { return JVS_SENSEIN_IOREADY; }
+                    else { return JVS_SENSEIN_NOIO; }
+                case JVS_SENSEIN_IS_DSR:
+                    if (_comPort.DsrHolding) { return JVS_SENSEIN_IOREADY; }
+                    else { return JVS_SENSEIN_NOIO; }
+                case JVS_SENSEIN_IS_CD_DSR:
+                    if (_comPort.CDHolding && !_comPort.DsrHolding) { return JVS_SENSEIN_IOPRESENT; }
+                    else if (_comPort.CDHolding && _comPort.DsrHolding) { return JVS_SENSEIN_IOREADY; }
+                    else { return JVS_SENSEIN_NOIO; }
+                default:
+                    return JVS_SENSEIN_IOREADY;
             }
-            else if (_useDSR)
-            {
-                if (_comPort.DsrHolding)
-                {
-                    return 1;
-                }
-                else
-                {
-                    return 0;
-                }
-            }
-            else return 1;
         }
 
-        private int Resend()
+        public int Resend()
         {
             Console.WriteLine("JVS: Resend last packet");
-            return Write(TXBuffer);
+            int errorCode = Write(_TXLastSent);
+            return errorCode;
         }
 
         public int Write(JVS_Frame _f)
@@ -380,7 +473,7 @@ namespace SharpJVS
             try
             {
                 _comPort.Write(data, 0, data.Length);
-                TXBuffer = _f;
+                _TXLastSent = _f;
             }
             catch (Exception ex)
             {
@@ -391,6 +484,23 @@ namespace SharpJVS
 
         public JVS_Frame Read()
         {
+            JVS_Frame _rx = null;
+            if (_RXBuffer.Count() == 0)
+            {
+                _rxFlag = false;
+                _rx = ReadFrame();
+                if (_rx == null) return null;
+
+                _RXBuffer.Add(_rx);
+            }
+            _rx = _RXBuffer[0];
+            _RXBuffer.RemoveAt(0);
+            _rxFlag = (_RXBuffer.Count() > 0);
+            return _rx;
+        }
+
+        private JVS_Frame ReadFrame()
+        {
             if (WaitForBytes(5) != 0) { return null; }
 
             List<byte> _d = new List<byte> { };
@@ -399,6 +509,7 @@ namespace SharpJVS
             bool _fDone = false;
             int _fIndex = 0;
             int _fStep = 0;
+            byte numBytes;
 
             while (!_fDone && _errCode == 0)
             {
@@ -415,7 +526,7 @@ namespace SharpJVS
                         break;
                     case 1:
                         // JVS ID
-                        if (_d[_fIndex++] == thisNodeID)
+                        if (_d[_fIndex++] == thisNodeInfo.NodeID)
                         {
                             _fStep++;
                         }
@@ -426,10 +537,10 @@ namespace SharpJVS
                         break;
                     case 2:
                         // JVS Number of bytes
-                        byte x = _d[_fIndex++];
-                        if (_comPort.BytesToRead < x)
+                        numBytes = _d[_fIndex++];
+                        if (_comPort.BytesToRead < numBytes)
                         {
-                            if (WaitForBytes(x) != 0)
+                            if (WaitForBytes(numBytes) != 0)
                             {
                                 // Prevent timeout whilst waiting for rest of packet
                                 Console.WriteLine("JVS: Timeout whilst waiting for remainder of packet.");
@@ -439,7 +550,7 @@ namespace SharpJVS
                         }
 
                         // All bytes are in buffer?
-                        while (_comPort.BytesToRead > 0)
+                        for (int x = 0; x < numBytes; x++)
                         {
                             _d.Add((byte)_comPort.ReadByte());
                         }
@@ -483,29 +594,20 @@ namespace SharpJVS
         }
 
         // Set the node ID. 0x00 is reserved for the host, 0xFF for broadcast packets
-        public int SetID(int id)
+        public int SetThisID(int id)
         {
             if (id != JVS_HOST_ADDR && id != JVS_BROADCAST_ADDR)
             {
-                thisNodeID = (byte)id;
-                //jvsReady = true;
-                SetSense(JVS_SENSE_ACTIVE);
-                //sendReport(JVS_STATUS_NORMAL, JVS_REPORT_NORMAL);
+                thisNodeInfo.NodeID = (byte)id;
+                SetSense(JVS_SENSEOUT_ACTIVE);
                 return 0;
             }
             return id;
         }
 
-        public bool Update()
-        {
-            if (_comPort.BytesToRead >= 5) RXBuffer = Read();
-            return _rxFlag;
-        }
-
         public int RunCommand()
         {
-            //rxFlag = false;
-            return RunCommand(RXBuffer);
+            return RunCommand(Read());
         }
 
         public int RunCommand(JVS_Frame _RX)
@@ -518,7 +620,7 @@ namespace SharpJVS
 
             if (thisNodeInfo == null)
             {
-                Console.WriteLine("JVS Error: Info array not set, runCommand would likely fail!");
+                Console.WriteLine("JVS Error: Info array not set, runCommand would fail!");
                 return 2;
             }
 
@@ -553,11 +655,11 @@ namespace SharpJVS
                         {
                             // Is downstream port reporting an ID (if one exists)
                             assignID = true;
-                            //Console.WriteLine(assignID ? "JVS: AssignID: True" : "JVS: assignID: False");
+                            //
                         }
                         if (assignID)
                         {
-                            if (SetID(_RX.data[c]) == 254)
+                            if (SetThisID(_RX.data[c]) == 254)
                             {
                                 Console.WriteLine("JVS Recieved: Couldn't set ID");
                             }
@@ -566,6 +668,7 @@ namespace SharpJVS
                                 responseNeeded = true;
                                 statusCode = JVS_STATUS_NORMAL;
                                 data.Append(JVS_REPORT_NORMAL);
+                                Console.WriteLine("JVS: AssignID: " + thisNodeInfo.NodeID);
                             }
                         }
                         else
@@ -865,8 +968,12 @@ namespace SharpJVS
         {
             if (_comPort.BytesToRead >= 5)
             {
-                RXBuffer = Read();
-                if (RXBuffer != null) { _rxFlag = true; }
+                JVS_Frame _rx = ReadFrame();
+                if (_rx != null)
+                {
+                    _RXBuffer.Add(_rx);
+                    if (_RXBuffer.Count() > 0) { _rxFlag = true; }
+                }
             }
             return _rxFlag;
         }
@@ -875,7 +982,7 @@ namespace SharpJVS
         {
             if (thisNodeInfo.NodeID != JVS_HOST_ADDR)
             {
-                SetSense(JVS_SENSE_INACTIVE);         // High means ID not assigned
+                SetSense(JVS_SENSEOUT_INACTIVE);         // High means ID not assigned
                 thisNodeInfo.NodeID = 0xFE;
                 // If we were handling other things like analog outputs, we would need to clear those too.
                 if (outputSlots != null)
@@ -894,10 +1001,15 @@ namespace SharpJVS
         // Sets the JVS sense line. Send HIGH to set sense to 5V
         public void SetSense(bool s)
         {
-            Console.WriteLine("JVS: Set sense pin: " + (s ? "0V" : "2.5V"));
-            if (_useDTR)
+
+            if (_comSenseOutPin == JVS_SENSEOUT_IS_DTR)
             {
+                Console.WriteLine("JVS: Set sense pin: " + (s ? "0V" : "2.5V"));
                 _comPort.DtrEnable = s;
+            }
+            else
+            {
+                Console.WriteLine("JVS Error: Cannot set SenseOut pin, no pin set.");
             }
         }
 
@@ -916,11 +1028,19 @@ namespace SharpJVS
             // GPO1
             // Writes output byte array from GPO 0 to X
             // Only use for IO boards with more than 8 GPOs
-            Console.WriteLine("JVS: Write GPO1");
+            Console.Write("JVS: Write GPO1 to ID: {0}: ", id);
+            for (int b = 0; b < data.Length; b++)
+            {
+                Console.Write("{0}:0x{1:X} ", b, data[b]);
+            }
+            Console.WriteLine();
 
             if (thisNodeInfo.NodeID == JVS_HOST_ADDR)
             {
-                List<byte> dataList = new List<byte> { };
+                List<byte> dataList = new List<byte>
+                {
+                    JVS_GENERICOUT1_CODE
+                };
                 dataList.AddRange(data);
                 JVS_Frame frame = new JVS_Frame(id, dataList);
                 Write(frame);
@@ -932,8 +1052,8 @@ namespace SharpJVS
             // GPO2
             // Writes output byte array from GPO 0 to X
             // Not all IO boards support this command
-
-            Console.WriteLine("JVS: Write GPO2");
+            Console.Write("JVS: Write GPO2 to ID: {0}: ", id);
+            Console.WriteLine("0x{0:X} ", data);
 
             if (thisNodeInfo.NodeID == JVS_HOST_ADDR)
             {
@@ -980,7 +1100,8 @@ namespace SharpJVS
 
         public void WriteMainID(byte id)
         {
-            // Write the ID string located in _info under mainID
+            // Write the ID string located in _info under mainId
+            Console.WriteLine("JVS: Write Main ID: " + thisNodeInfo.Identity);
             if (thisNodeInfo.NodeID == JVS_HOST_ADDR)
             {
                 List<byte> data = new List<byte> { };
@@ -1140,8 +1261,8 @@ namespace SharpJVS
             }
         }
 
-        public byte DEC2BCD(byte dec) { return (byte)(((dec / 10) << 4) + (dec % 10)); }
-        public byte BCD2DEC(byte bcd) { return (byte)(((bcd >> 4) * 10) + (bcd & 0xf)); }
+        public static byte DEC2BCD(byte dec) { return (byte)(((dec / 10) << 4) + (dec % 10)); }
+        public static byte BCD2DEC(byte bcd) { return (byte)(((bcd >> 4) * 10) + (bcd & 0xf)); }
     }
 }
 
@@ -1259,9 +1380,9 @@ namespace PSJVS.Containers
             if (isHost)
             {
                 statusCode = rawPacket[idx++];
-                for (int i = 0; i < numBytes-2; i++)
+                for (int i = 0; i < numBytes - 2; i++)
                 {
-                   data.Add(rawPacket[idx++]);
+                    data.Add(rawPacket[idx++]);
                 }
             }
             sum = rawPacket[idx++];
